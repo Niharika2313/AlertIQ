@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+openai-whisper
+torch==2.5.1
+imageio-ffmpeg
+python-multipart
