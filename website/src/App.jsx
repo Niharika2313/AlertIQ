@@ -1,10 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import {
   MapContainer,
   TileLayer,
   Marker,
   Polyline,
-  Circle,
   Popup,
   useMap,
 } from "react-leaflet";
@@ -31,233 +30,283 @@ const redIcon = new L.Icon({
   popupAnchor: [0, -48],
 });
 
-// Component to handle map bounds updates
+// Component to handle map auto-centering
 function MapController({ locations }) {
   const map = useMap();
 
   useEffect(() => {
-    if (locations.length > 1) {
-      const bounds = L.latLngBounds(locations);
-      map.fitBounds(bounds, { padding: [50, 50] });
-    } else if (locations.length === 1) {
-      map.setView(locations[0], 16);
+    if (locations && locations.length > 0) {
+      const latLngs = locations.map((loc) => [loc.lat, loc.lng]);
+
+      if (latLngs.length > 1) {
+        const bounds = L.latLngBounds(latLngs);
+        map.fitBounds(bounds, { padding: [50, 50] });
+      } else {
+        map.setView(latLngs[0], 16);
+      }
     }
   }, [locations, map]);
 
   return null;
 }
 
-function App() {
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
-  const [sessionData, setSessionData] = useState(null);
-  const [locations, setLocations] = useState([]);
-  const [updateCount, setUpdateCount] = useState(0);
-  const [lastUpdate, setLastUpdate] = useState(null);
-  const [ended, setEnded] = useState(false);
+// Extract sessionId from URL
+function getSessionIdFromUrl() {
+  const path = window.location.pathname;
+  const match = path.match(/\/tracking\/([^/]+)/);
+  return match ? match[1] : null;
+}
+
+export default function App() {
+  const [sessionId] = useState(() => getSessionIdFromUrl());
+  const [session, setSession] = useState(null);
+  const [loading, setLoading] = useState(() => !!sessionId);
+  const [error, setError] = useState(
+    sessionId ? null : "Invalid tracking link",
+  );
   const eventSourceRef = useRef(null);
 
-  const API_URL =
-    import.meta.env.VITE_API_URL || "http://localhost:5000/api/sos";
-  const sessionId = window.location.pathname.split("/").pop();
+  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
   useEffect(() => {
-    // Connect to SSE stream
-    const eventSource = new EventSource(`${API_URL}/stream/${sessionId}`);
+    if (!sessionId) {
+      return;
+    }
+
+    console.log("🔍 Loading session:", sessionId);
+
+    // Fetch initial session data
+    fetch(`${API_URL}/sos/session/${sessionId}`)
+      .then((res) => {
+        console.log("📥 Response status:", res.status);
+        if (!res.ok) throw new Error("Session not found");
+        return res.json();
+      })
+      .then((data) => {
+        console.log("✅ Session data:", data);
+        setSession(data);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error("❌ Error loading session:", err);
+        setError(err.message);
+        setLoading(false);
+      });
+
+    // Connect to SSE stream for live updates
+    const eventSource = new EventSource(`${API_URL}/sos/stream/${sessionId}`);
     eventSourceRef.current = eventSource;
 
-    eventSource.addEventListener("message", (event) => {
+    eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
+      console.log("📡 SSE event:", data);
 
       if (data.type === "init") {
-        setSessionData({
-          userName: data.session.userName,
-          createdAt: data.session.createdAt,
-        });
-
-        if (data.session.locations && data.session.locations.length > 0) {
-          const locs = data.session.locations.map((loc) => [loc.lat, loc.lng]);
-          setLocations(locs);
-          setUpdateCount(data.session.locations.length);
-          setLastUpdate(
-            new Date(
-              data.session.locations[data.session.locations.length - 1]
-                .timestamp,
-            ),
-          );
-        }
-
-        if (data.session.ended) {
-          setEnded(true);
-        }
-
-        setLoading(false);
+        setSession(data.session);
       } else if (data.type === "update") {
-        const newLoc = [data.location.lat, data.location.lng];
-        setLocations((prev) => [...prev, newLoc]);
-        setUpdateCount((prev) => prev + 1);
-        setLastUpdate(new Date(data.location.timestamp));
+        setSession((prev) => ({
+          ...prev,
+          locations: [...(prev?.locations || []), data.location],
+        }));
       } else if (data.type === "ended") {
-        setEnded(true);
+        setSession((prev) => ({ ...prev, ended: true }));
+        alert("Tracking has ended. User is safe!");
+        eventSource.close();
       }
-    });
+    };
 
     eventSource.onerror = (err) => {
-      console.error("SSE Error:", err);
-      if (eventSource.readyState === EventSource.CLOSED) {
-        setError(true);
-        setLoading(false);
-      }
+      console.error("❌ SSE error:", err);
+      eventSource.close();
     };
 
     return () => {
-      eventSource.close();
+      console.log("🧹 Cleaning up SSE connection");
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
     };
-  }, [API_URL, sessionId]);
+  }, [sessionId, API_URL]);
 
-  const getTimeAgo = (date) => {
-    if (!date) return "Unknown";
-
-    const seconds = Math.floor((new Date() - date) / 1000);
-
-    if (seconds < 10) return "Just now";
-    if (seconds < 60) return `${seconds} seconds ago`;
-
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes} minute${minutes > 1 ? "s" : ""} ago`;
-
-    const hours = Math.floor(minutes / 60);
-    return `${hours} hour${hours > 1 ? "s" : ""} ago`;
-  };
-
-  if (loading) {
+  if (!sessionId || error) {
     return (
-      <div className="loading-container">
-        <div className="spinner"></div>
-        <p>Loading tracking session...</p>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="error-container">
-        <div className="error-panel">
-          <h2>⚠️ Session Not Found</h2>
-          <p>
-            This tracking session has expired or does not exist. Emergency
-            tracking sessions are active for 24 hours.
+      <div style={styles.container}>
+        <div style={styles.errorBox}>
+          <h2>❌ Error</h2>
+          <p>{error || "Invalid tracking link"}</p>
+          <p style={styles.helpText}>
+            This tracking link may have expired or is invalid.
           </p>
         </div>
       </div>
     );
   }
 
-  const currentPosition =
-    locations.length > 0 ? locations[locations.length - 1] : [0, 0];
-
-  return (
-    <div className="app">
-      <div className="info-panel">
-        <h2>{sessionData?.userName || "User"}</h2>
-        <div className="subtitle">Emergency Alert</div>
-
-        <div className={`status ${ended ? "ended" : "active"}`}>
-          {!ended && <div className="pulse-dot"></div>}
-          <span>{ended ? "✅ User is Safe" : "Live Tracking"}</span>
-        </div>
-
-        <div className="info-row">
-          <svg
-            className="icon"
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="2"
-              d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-            ></path>
-          </svg>
-          <div>
-            <strong>Last Update:</strong>
-            <br />
-            <span>{getTimeAgo(lastUpdate)}</span>
-          </div>
-        </div>
-
-        <div className="info-row">
-          <svg
-            className="icon"
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="2"
-              d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"
-            ></path>
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="2"
-              d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"
-            ></path>
-          </svg>
-          <div>
-            <strong>Updates:</strong>
-            <br />
-            <span>{updateCount} locations received</span>
-          </div>
+  if (loading) {
+    return (
+      <div style={styles.container}>
+        <div style={styles.loadingBox}>
+          <h2>Loading tracking information...</h2>
+          <div style={styles.spinner}></div>
         </div>
       </div>
+    );
+  }
 
-      {locations.length > 0 && (
-        <MapContainer
-          center={currentPosition}
-          zoom={16}
-          style={{ height: "100vh", width: "100%" }}
-          zoomControl={true}
-        >
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
+  const locations = session?.locations || [];
+  const lastLocation =
+    locations.length > 0 ? locations[locations.length - 1] : null;
+  const defaultCenter = lastLocation
+    ? [lastLocation.lat, lastLocation.lng]
+    : [20.0, 77.0];
 
-          <MapController locations={locations} />
+  return (
+    <div style={styles.container}>
+      <div style={styles.header}>
+        <h1>🚨 Emergency Tracking</h1>
+        <h2>{session?.userName}</h2>
+        <p style={styles.status}>
+          {session?.ended
+            ? "✅ Safe - Tracking Ended"
+            : "🔴 Live Tracking Active"}
+        </p>
+        <p style={styles.timestamp}>
+          Started: {new Date(session?.createdAt).toLocaleString()}
+        </p>
+        {locations.length > 0 && (
+          <p style={styles.updates}>{locations.length} location update(s)</p>
+        )}
+      </div>
 
-          <Circle
-            center={currentPosition}
-            radius={50}
-            pathOptions={{
-              color: "#dc2626",
-              fillColor: "#fee2e2",
-              fillOpacity: 0.3,
-            }}
-          />
-
-          <Marker position={currentPosition} icon={redIcon}>
-            <Popup>Current Location</Popup>
-          </Marker>
-
-          {locations.length > 1 && (
-            <Polyline
-              positions={locations}
-              pathOptions={{
-                color: "#dc2626",
-                weight: 3,
-                opacity: 0.7,
-              }}
+      <div style={styles.mapContainer}>
+        {locations.length === 0 ? (
+          <div style={styles.noData}>
+            <p>⏳ Waiting for location data...</p>
+          </div>
+        ) : (
+          <MapContainer
+            center={defaultCenter}
+            zoom={16}
+            style={{ height: "100%", width: "100%" }}
+            zoomControl={true}
+          >
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
-          )}
-        </MapContainer>
-      )}
+
+            <MapController locations={locations} />
+
+            {/* Draw path */}
+            {locations.length > 1 && (
+              <Polyline
+                positions={locations.map((loc) => [loc.lat, loc.lng])}
+                color="#DC2626"
+                weight={3}
+                opacity={0.8}
+              />
+            )}
+
+            {/* Show all location markers */}
+            {locations.map((loc, index) => (
+              <Marker
+                key={index}
+                position={[loc.lat, loc.lng]}
+                icon={index === locations.length - 1 ? redIcon : undefined}
+              >
+                <Popup>
+                  <strong>
+                    {index === locations.length - 1
+                      ? "Current Location"
+                      : `Point ${index + 1}`}
+                  </strong>
+                  <br />
+                  {new Date(loc.timestamp).toLocaleString()}
+                </Popup>
+              </Marker>
+            ))}
+          </MapContainer>
+        )}
+      </div>
+
+      <div style={styles.footer}>
+        <p>
+          ⚠️ If this is an emergency, please call local emergency services
+          immediately
+        </p>
+      </div>
     </div>
   );
 }
 
-export default App;
+const styles = {
+  container: {
+    width: "100%",
+    height: "100vh",
+    display: "flex",
+    flexDirection: "column",
+    fontFamily: "Arial, sans-serif",
+  },
+  header: {
+    backgroundColor: "#dc2626",
+    color: "white",
+    padding: "20px",
+    textAlign: "center",
+  },
+  status: {
+    fontSize: "18px",
+    fontWeight: "bold",
+    margin: "10px 0",
+  },
+  timestamp: {
+    fontSize: "14px",
+    opacity: 0.9,
+  },
+  updates: {
+    fontSize: "14px",
+    opacity: 0.9,
+  },
+  mapContainer: {
+    flex: 1,
+    width: "100%",
+    position: "relative",
+  },
+  noData: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    height: "100%",
+    fontSize: "18px",
+    color: "#6b7280",
+  },
+  footer: {
+    backgroundColor: "#1f2937",
+    color: "white",
+    padding: "15px",
+    textAlign: "center",
+  },
+  loadingBox: {
+    margin: "auto",
+    textAlign: "center",
+    padding: "40px",
+  },
+  spinner: {
+    border: "4px solid #f3f3f3",
+    borderTop: "4px solid #dc2626",
+    borderRadius: "50%",
+    width: "40px",
+    height: "40px",
+    animation: "spin 1s linear infinite",
+    margin: "20px auto",
+  },
+  errorBox: {
+    margin: "auto",
+    textAlign: "center",
+    padding: "40px",
+    maxWidth: "500px",
+  },
+  helpText: {
+    marginTop: "20px",
+    color: "#6b7280",
+  },
+};

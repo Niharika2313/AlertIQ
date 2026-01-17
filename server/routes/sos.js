@@ -3,16 +3,13 @@ dotenv.config();
 
 import express from "express";
 import User from "../models/User.js";
+import Session from "../models/Session.js";
 import twilio from "twilio";
 import crypto from "crypto";
 
 const router = express.Router();
 
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
-
-// In-memory store for active sessions (use Redis in production)
-const activeSessions = new Map();
-// sessionId -> { uid, userName, userPhone, locations: [], activeViewers: 0, createdAt, ended: false }
 
 // Generate unique session ID
 function generateSessionId() {
@@ -21,21 +18,46 @@ function generateSessionId() {
 
 // Trigger SOS - Create session and send SMS with tracking link
 router.post("/trigger", async (req, res) => {
-  console.log("SOS API HIT");
+  console.log("🚨 SOS API HIT");
 
   const { uid, location } = req.body;
 
   try {
     const user = await User.findOne({ uid });
 
+    console.log("👤 User:", user?.name);
+
     if (!user) {
-      console.log("User not found");
+      console.log("❌ User not found");
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Create tracking session
+    // Validate emergency contacts exist
+    if (!user.emergencyContacts || user.emergencyContacts.length === 0) {
+      return res.status(400).json({
+        error: "No emergency contacts configured for this user",
+      });
+    }
+
+    // Validate Twilio configuration
+    if (!process.env.TWILIO_PHONE) {
+      console.error("❌ TWILIO_PHONE not configured in environment variables");
+      return res.status(500).json({
+        error: "SMS service not configured",
+      });
+    }
+
+    // Ensure Twilio phone has + prefix
+    const twilioPhone = process.env.TWILIO_PHONE.startsWith("+")
+      ? process.env.TWILIO_PHONE
+      : `+${process.env.TWILIO_PHONE}`;
+
+    console.log("📞 Twilio Phone:", twilioPhone);
+
+    // Create tracking session in MongoDB
     const sessionId = generateSessionId();
-    activeSessions.set(sessionId, {
+    const session = await Session.create({
+      sessionId,
       uid,
       userName: user.name || "User",
       userPhone: user.phone,
@@ -43,43 +65,85 @@ router.post("/trigger", async (req, res) => {
         {
           lat: location.lat,
           lng: location.lng,
-          timestamp: new Date().toISOString(),
+          timestamp: new Date(),
         },
       ],
       activeViewers: 0,
-      createdAt: new Date(),
       ended: false,
     });
+
+    console.log("✅ Session created:", sessionId);
 
     // Generate tracking link
     const trackingUrl = `${process.env.WEB_URL || "http://localhost:3000"}/track/${sessionId}`;
 
-    const message = `🚨 EMERGENCY ALERT from ${user.name || "User"}!
+    console.log("🔗 Tracking URL:", trackingUrl);
 
-Click to track live location:
-${trackingUrl}
+    // Shorter message to stay under trial account's 4-segment limit
+    const message = `🚨 EMERGENCY from ${user.name || "User"}!
 
-This link shows real-time location updates.`;
+Track location: ${trackingUrl}`;
 
     const results = [];
 
+    console.log(
+      `📨 Sending SMS to ${user.emergencyContacts.length} contacts...`,
+    );
+
     for (const contact of user.emergencyContacts) {
       try {
-        await client.messages.create({
+        // Ensure contact phone has + prefix
+        const contactPhone = contact.phone.startsWith("+")
+          ? contact.phone
+          : `+${contact.phone}`;
+
+        console.log(`📤 Sending to ${contact.name} (${contactPhone})...`);
+
+        const messageResult = await client.messages.create({
           body: message,
-          from: process.env.TWILIO_PHONE,
-          to: contact.phone,
+          from: twilioPhone,
+          to: contactPhone,
         });
-        results.push({ phone: contact.phone, status: "sent" });
+
+        console.log(`✅ SMS sent successfully. SID: ${messageResult.sid}`);
+        console.log(`   Status: ${messageResult.status}`);
+
+        results.push({
+          name: contact.name,
+          phone: contactPhone,
+          status: "sent",
+          sid: messageResult.sid,
+          twilioStatus: messageResult.status,
+        });
       } catch (err) {
-        console.log("SMS Error:", err.message);
-        results.push({ phone: contact.phone, status: "failed" });
+        console.error(`❌ SMS Error for ${contact.name}:`, err.message);
+        results.push({
+          name: contact.name,
+          phone: contact.phone,
+          status: "failed",
+          error: err.message,
+        });
       }
     }
 
-    res.json({ success: true, sessionId, results });
+    // Log summary
+    const successCount = results.filter((r) => r.status === "sent").length;
+    console.log(
+      `📊 SMS Summary: ${successCount}/${results.length} sent successfully`,
+    );
+
+    res.json({
+      success: true,
+      sessionId,
+      results,
+      summary: {
+        total: results.length,
+        sent: successCount,
+        failed: results.length - successCount,
+      },
+    });
   } catch (err) {
-    console.error("SOS trigger error:", err);
+    console.error("💥 SOS trigger error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -88,164 +152,211 @@ This link shows real-time location updates.`;
 router.post("/update-location", async (req, res) => {
   const { sessionId, location, timestamp } = req.body;
 
-  const session = activeSessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: "Session not found" });
-  }
+  try {
+    const session = await Session.findOne({ sessionId });
 
-  if (session.ended) {
-    return res.json({ success: false, message: "Session already ended" });
-  }
-
-  // Only store location if someone is actively viewing
-  if (session.activeViewers > 0) {
-    session.locations.push({
-      lat: location.lat,
-      lng: location.lng,
-      timestamp: timestamp || new Date().toISOString(),
-    });
-
-    // Keep only last 100 locations to save memory
-    if (session.locations.length > 100) {
-      session.locations = session.locations.slice(-100);
+    if (!session) {
+      console.log("❌ Session not found:", sessionId);
+      return res.status(404).json({ error: "Session not found" });
     }
 
-    console.log(
-      `Location updated for session ${sessionId}. Active viewers: ${session.activeViewers}`,
-    );
-  }
+    if (session.ended) {
+      return res.json({ success: false, message: "Session already ended" });
+    }
 
-  res.json({
-    success: true,
-    viewersActive: session.activeViewers > 0,
-    message:
-      session.activeViewers > 0
-        ? "Location stored"
-        : "No active viewers, location not stored",
-  });
+    // Only store location if someone is actively viewing
+    if (session.activeViewers > 0) {
+      session.locations.push({
+        lat: location.lat,
+        lng: location.lng,
+        timestamp: timestamp || new Date(),
+      });
+
+      // Keep only last 100 locations to save memory
+      if (session.locations.length > 100) {
+        session.locations = session.locations.slice(-100);
+      }
+
+      await session.save();
+
+      console.log(
+        `📍 Location updated for session ${sessionId}. Active viewers: ${session.activeViewers}`,
+      );
+    }
+
+    res.json({
+      success: true,
+      viewersActive: session.activeViewers > 0,
+      message:
+        session.activeViewers > 0
+          ? "Location stored"
+          : "No active viewers, location not stored",
+    });
+  } catch (err) {
+    console.error("💥 Location update error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // End session
 router.post("/end-session", async (req, res) => {
   const { sessionId } = req.body;
 
-  const session = activeSessions.get(sessionId);
-  if (session) {
-    session.ended = true;
-    session.endedAt = new Date();
-    console.log(`Session ${sessionId} ended by user`);
-  }
+  try {
+    const session = await Session.findOne({ sessionId });
 
-  res.json({ success: true });
+    if (session) {
+      session.ended = true;
+      session.endedAt = new Date();
+      await session.save();
+      console.log(`🛑 Session ${sessionId} ended by user`);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("💥 End session error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get session data (for tracking website)
-router.get("/session/:sessionId", (req, res) => {
+router.get("/session/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  const session = activeSessions.get(sessionId);
 
-  if (!session) {
-    return res.status(404).json({ error: "Session not found or expired" });
+  console.log("🔍 Looking for session:", sessionId);
+
+  try {
+    const session = await Session.findOne({ sessionId });
+
+    if (!session) {
+      console.log("❌ Session not found!");
+      const allSessions = await Session.find({}).select("sessionId createdAt");
+      console.log(
+        "📋 Available sessions:",
+        allSessions.map((s) => s.sessionId),
+      );
+      return res.status(404).json({ error: "Session not found or expired" });
+    }
+
+    console.log("✅ Session found:", session.userName);
+    console.log("📊 Locations:", session.locations.length);
+    console.log("👥 Active viewers:", session.activeViewers);
+
+    res.json({
+      userName: session.userName,
+      locations: session.locations,
+      ended: session.ended,
+      createdAt: session.createdAt,
+      endedAt: session.endedAt || null,
+    });
+  } catch (err) {
+    console.error("💥 Get session error:", err);
+    res.status(500).json({ error: err.message });
   }
-
-  res.json({
-    userName: session.userName,
-    locations: session.locations,
-    ended: session.ended,
-    createdAt: session.createdAt,
-    endedAt: session.endedAt || null,
-  });
 });
 
 // Server-Sent Events endpoint for live updates
-router.get("/stream/:sessionId", (req, res) => {
+router.get("/stream/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  const session = activeSessions.get(sessionId);
 
-  if (!session) {
-    return res.status(404).json({ error: "Session not found" });
-  }
+  try {
+    const session = await Session.findOne({ sessionId });
 
-  // Set up Server-Sent Events
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  // Increment active viewers
-  session.activeViewers++;
-  console.log(
-    `Viewer connected to session ${sessionId}. Active viewers: ${session.activeViewers}`,
-  );
-
-  // Send initial data
-  res.write(
-    `data: ${JSON.stringify({
-      type: "init",
-      session: {
-        userName: session.userName,
-        locations: session.locations,
-        ended: session.ended,
-        createdAt: session.createdAt,
-      },
-    })}\n\n`,
-  );
-
-  let lastLocationIndex = session.locations.length;
-
-  // Send updates every 2 seconds
-  const interval = setInterval(() => {
-    // Check for new locations
-    if (session.locations.length > lastLocationIndex) {
-      const newLocations = session.locations.slice(lastLocationIndex);
-      newLocations.forEach((location) => {
-        res.write(`data: ${JSON.stringify({ type: "update", location })}\n\n`);
-      });
-      lastLocationIndex = session.locations.length;
+    if (!session) {
+      console.log("❌ Stream: Session not found:", sessionId);
+      return res.status(404).json({ error: "Session not found" });
     }
 
-    // Check if session ended
-    if (session.ended) {
-      res.write(
-        `data: ${JSON.stringify({ type: "ended", endedAt: session.endedAt })}\n\n`,
-      );
-      clearInterval(interval);
-      res.end();
-    }
-  }, 2000);
+    // Set up Server-Sent Events
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Clean up on disconnect
-  req.on("close", () => {
-    clearInterval(interval);
-    session.activeViewers--;
+    // Increment active viewers
+    session.activeViewers++;
+    await session.save();
+
     console.log(
-      `Viewer disconnected from session ${sessionId}. Active viewers: ${session.activeViewers}`,
+      `👁️ Viewer connected to session ${sessionId}. Active viewers: ${session.activeViewers}`,
     );
-  });
-});
 
-// Clean up old sessions (run every 5 minutes)
-setInterval(
-  () => {
-    const now = new Date();
-    let cleaned = 0;
+    // Send initial data
+    res.write(
+      `data: ${JSON.stringify({
+        type: "init",
+        session: {
+          userName: session.userName,
+          locations: session.locations,
+          ended: session.ended,
+          createdAt: session.createdAt,
+        },
+      })}\n\n`,
+    );
 
-    for (const [sessionId, session] of activeSessions.entries()) {
-      const ageHours = (now - session.createdAt) / (1000 * 60 * 60);
-      // Delete sessions older than 24 hours
-      if (ageHours > 24) {
-        activeSessions.delete(sessionId);
-        cleaned++;
+    let lastLocationIndex = session.locations.length;
+
+    // Send updates every 2 seconds
+    const interval = setInterval(async () => {
+      try {
+        const currentSession = await Session.findOne({ sessionId });
+
+        if (!currentSession) {
+          clearInterval(interval);
+          res.end();
+          return;
+        }
+
+        // Check for new locations
+        if (currentSession.locations.length > lastLocationIndex) {
+          const newLocations =
+            currentSession.locations.slice(lastLocationIndex);
+          newLocations.forEach((location) => {
+            res.write(
+              `data: ${JSON.stringify({ type: "update", location })}\n\n`,
+            );
+          });
+          lastLocationIndex = currentSession.locations.length;
+        }
+
+        // Check if session ended
+        if (currentSession.ended) {
+          res.write(
+            `data: ${JSON.stringify({ type: "ended", endedAt: currentSession.endedAt })}\n\n`,
+          );
+          clearInterval(interval);
+          res.end();
+        }
+      } catch (err) {
+        console.error("💥 Stream interval error:", err);
+        clearInterval(interval);
+        res.end();
       }
-    }
+    }, 2000);
 
-    if (cleaned > 0) {
-      console.log(
-        `Cleaned up ${cleaned} old sessions. Active sessions: ${activeSessions.size}`,
-      );
-    }
-  },
-  5 * 60 * 1000,
-);
+    // Clean up on disconnect
+    req.on("close", async () => {
+      clearInterval(interval);
+      try {
+        const currentSession = await Session.findOne({ sessionId });
+        if (currentSession) {
+          currentSession.activeViewers = Math.max(
+            0,
+            currentSession.activeViewers - 1,
+          );
+          await currentSession.save();
+          console.log(
+            `👋 Viewer disconnected from session ${sessionId}. Active viewers: ${currentSession.activeViewers}`,
+          );
+        }
+      } catch (err) {
+        console.error("💥 Disconnect cleanup error:", err);
+      }
+    });
+  } catch (err) {
+    console.error("💥 Stream setup error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 export default router;
