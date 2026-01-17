@@ -50,20 +50,18 @@ function MapController({ locations }) {
   return null;
 }
 
-// Extract sessionId from URL
+// Extract sessionId from URL - handles /track/:sessionId
 function getSessionIdFromUrl() {
   const path = window.location.pathname;
-  const match = path.match(/\/tracking\/([^/]+)/);
+  const match = path.match(/\/track\/([^/]+)/);
   return match ? match[1] : null;
 }
 
 export default function App() {
   const [sessionId] = useState(() => getSessionIdFromUrl());
   const [session, setSession] = useState(null);
-  const [loading, setLoading] = useState(() => !!sessionId);
-  const [error, setError] = useState(
-    sessionId ? null : "Invalid tracking link",
-  );
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const eventSourceRef = useRef(null);
 
   const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
