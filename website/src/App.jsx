@@ -74,7 +74,7 @@ export default function App() {
     console.log("🔍 Loading session:", sessionId);
 
     // Fetch initial session data
-    fetch(`${API_URL}/sos/session/${sessionId}`)
+    fetch(`${API_URL}/session/${sessionId}`)
       .then((res) => {
         console.log("📥 Response status:", res.status);
         if (!res.ok) throw new Error("Session not found");
@@ -92,7 +92,7 @@ export default function App() {
       });
 
     // Connect to SSE stream for live updates
-    const eventSource = new EventSource(`${API_URL}/sos/stream/${sessionId}`);
+    const eventSource = new EventSource(`${API_URL}/stream/${sessionId}`);
     eventSourceRef.current = eventSource;
 
     eventSource.onmessage = (event) => {
